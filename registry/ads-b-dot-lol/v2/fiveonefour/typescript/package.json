@@ -1,0 +1,38 @@
+{
+  "name": "@registry/ads-b-dot-lol",
+  "version": "2.0.0",
+  "description": "ADS-B.lol API connector for real-time aircraft tracking",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node tests/run-tests.js",
+    "test:unit": "node tests/simple-test.js", 
+    "test:jest": "pnpm exec jest",
+    "test:watch": "pnpm exec jest --watch",
+    "test:coverage": "pnpm exec jest --coverage",
+    "test:live": "pnpm run build && node tests/test-live.js",
+    "test:all": "pnpm run test:unit && pnpm run test:live",
+    "test:quick": "pnpm run build && node -e \"console.log('Quick smoke test...'); const {AdsbConnector} = require('./dist/src/index.js'); const c = new AdsbConnector(); console.log('✅ Connector loads successfully');\""
+  },
+  "keywords": [
+    "ads-b",
+    "aircraft",
+    "tracking",
+    "aviation",
+    "api",
+    "connector"
+  ],
+  "dependencies": {
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.5.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

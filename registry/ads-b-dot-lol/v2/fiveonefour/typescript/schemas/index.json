@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schemas.connector-factory.dev/schema-index.schema.json",
+  "version": "2.0.0",
+  "datasets": [
+    {
+      "name": "aircraft",
+      "stage": "raw",
+      "kind": "json",
+      "path": "raw/json/aircraft.schema.json",
+      "doc": "raw/json/events.md"
+    },
+    {
+      "name": "aircraft_response",
+      "stage": "raw",
+      "kind": "json",
+      "path": "raw/json/aircraft-response.schema.json",
+      "doc": "raw/json/events.md"
+    },
+    {
+      "name": "aircraft",
+      "stage": "raw",
+      "kind": "relational",
+      "path": "raw/relational/tables.json",
+      "sql": "raw/relational/tables.sql",
+      "doc": "raw/relational/README.md"
+    },
+    {
+      "name": "aircraft_response",
+      "stage": "extracted",
+      "kind": "json",
+      "path": "extracted/json/events.schema.json",
+      "doc": "extracted/json/events.md"
+    },
+    {
+      "name": "aircraft_response",
+      "stage": "extracted",
+      "kind": "relational",
+      "path": "extracted/relational/tables.json",
+      "sql": "extracted/relational/tables.sql",
+      "doc": "extracted/relational/README.md"
+    }
+  ]
+}
