@@ -1,0 +1,594 @@
+export const metadata = {
+  title: "Blob Storage Connector Specification",
+  description: "A transport-agnostic specification for building robust, production-ready blob/object storage connectors (e.g., S3, Azure Blob Storage, GCS). This release is scoped to Analytical (Extract, read-only) use cases."
+}
+
+## Blob Storage Connector Specification
+
+This specification defines requirements, behaviors, and best practices for connectors that interact with blob/object storage systems. It is provider- and transport-agnostic. Implementations may use provider SDKs or HTTP APIs.
+
+Important: This version of the specification is limited to the Extract (read-only) profile. Write/mutation operations (e.g., put, copy, delete, multipart upload, upload streaming, presign for writes) are reserved for a future Full (read/write) profile release.
+
+### Scope and Principles
+
+- **Language-agnostic**: Defines contracts and data shapes, not tied to any language.
+- **Operation-centric**: Uses a generic execute(operationName, input, options) model instead of HTTP verbs.
+- **Separation of concerns**: Authentication, retries, rate limits, pagination, and streaming are modular.
+- **Deterministic, observable, testable**: Deterministic defaults, structured logs/metrics/traces, clear tests.
+- **Secure by default**: Credentials redacted, encrypted transport, input/output validation.
+- **Resilient**: Backoff with jitter, circuit breaking, retry budget, graceful degradation.
+- **Extensible**: Hooks/middleware enable customization without forking core.
+
+### Analytical Focus
+
+This specification targets analytical workloads (ELT/ETL, reporting, ML feature extraction), not transactional use cases.
+
+- **Read-only**: No mutations; principals and capabilities are least-privilege.
+- **Iterator-first**: Long-running scans via pagination with resume; large `pageSize` within provider limits.
+- **Throughput-oriented**: Bounded concurrency, backpressure-aware streaming, cost-aware request batching.
+- **Eventual consistency tolerant**: Handle duplicates and reordering; prefer dedupe by `(bucket,key,versionId|ETag)`.
+- **Checkpointable/resumable**: Expose continuation tokens, `LastModified`, and `VersionId` for incremental extraction.
+- **Observability for analytics**: Emphasize bytes read, throughput, page amplification, checkpoint lag, retry counts.
+
+Recommended defaults:
+- Prefer provider-maximum page size for listings, with adaptive tuning.
+- Use a global concurrency limit plus separate concurrency for downloads.
+- Apply exponential backoff with jitter; respect throttle hints; enforce per-operation retry budgets.
+
+### Core Methods
+
+Every blob connector must implement the following:
+
+#### Initialization and Lifecycle
+
+- **initialize(configuration)**  
+  Validate configuration and initialize internal state.
+
+- **connect()**  
+  Establish provider SDK or API client. Prepare pools/resources.
+
+- **disconnect()**  
+  Gracefully close resources, drain in-flight work.
+
+- **isConnected()**  
+  True when ready to issue operations.
+
+#### Operation Methods
+
+- **execute(operationName, input, options)**  
+  Generic entry point for all operations. Implementers may expose typed methods that delegate to `execute`.
+
+- High-level blob operations (recommended typed surface):
+  - **listObjects(options)** → Iterator of pages of items
+  - **getObject(params)** → Read object (support range reads)
+  - **getObjects(options)** → Analytical bulk read helper (composes list + get, respects pagination/backpressure)
+  - **headObject(params)** → Metadata lookup
+  - **downloadStream(params)** → Streaming reads with backpressure
+  - **presignGet(params, options)** / **presignHead(params, options)** → Generate presigned read/metadata URLs
+
+#### Analytical Bulk Retrieval: `getObjects`
+
+`getObjects(options)` is a convenience for analytical scans. It composes `listObjects` and `getObject` to fetch many objects efficiently while honoring pagination, concurrency, retries, and backpressure.
+
+- Pattern handling: Server-side globs are not standardized. Use `prefix` (and optional `delimiter`) for enumeration; optional client-side filters may refine matches.
+- Concurrency: Implement bounded parallel downloads; respect global limits. Default continues on errors, reporting them per-item.
+- Streaming: Prefer streaming fetches by default; support buffering if requested.
+- Resume: Honor continuation tokens and allow resuming from checkpoints.
+
+Conceptual usage:
+
+```text
+for page in listObjects({ bucket: "test-bucket", prefix: "foo", pageSize: 100 }):
+  for item in page.items:
+    obj = getObject({ bucket: "test-bucket", key: item.key })
+    handle(obj)
+```
+
+When you already have explicit keys, prefer `batch` to fetch many objects concurrently within rate/concurrency limits:
+
+```text
+keys = ["foo/a.json", "foo/b.json", "foo/c.json"]
+ops = keys.map(k => ({ operation: "getObject", input: { bucket: "test-bucket", key: k } }))
+results = batch(ops)
+```
+
+#### Common Types
+
+```ts
+type ObjectIdentifier = {
+  bucket: string
+  key: string
+  versionId?: string
+}
+
+type RangeRequest =
+  | { start: number; end: number }      // inclusive byte range
+  | { suffixBytes: number }             // last N bytes
+  | { prefixBytes: number }             // first N bytes
+
+type PresignOptions = {
+  expiresInSeconds: number
+  responseHeaderOverrides?: {
+    contentType?: string
+    cacheControl?: string
+    contentDisposition?: string
+  }
+}
+ 
+type ListObjectsOptions = {
+  bucket: string
+  prefix?: string
+  delimiter?: string
+  pageSize?: number
+  includeVersions?: boolean
+  startAfter?: string
+  continuationToken?: string
+}
+ 
+type GetObjectsOptions = ListObjectsOptions & {
+  maxConcurrentDownloads?: number
+  includeBody?: boolean // default streaming
+  filter?: (summary: object) => boolean // optional client-side predicate
+  onObject?: (result: {
+    key: string
+    data?: ReadableStream | Uint8Array
+    attributes: Record<string, unknown>
+    error?: Error
+  }) => Promise<void> | void
+  checkpoint?: {
+    continuationToken?: string
+    lastProcessedKey?: string
+    lastModifiedAfter?: string
+  }
+}
+```
+
+#### Object Identity
+
+- All operations that reference an object MUST use `{ bucket, key, versionId? }`.
+- Keys are treated as opaque UTF‑8 strings; providers may apply encoding rules. Do not alter caller‑supplied keys aside from required escaping in transport layers.
+
+#### Advanced Operations
+
+- **batch(operations)**  
+  Execute multiple operations; handle partial failures gracefully.
+
+- **paginate(options)**  
+  Unified iterator abstraction with provider-specific extractors.
+
+### Profiles and Capabilities
+
+To support different use-cases and simplify adoption, connectors SHOULD declare one or more profiles. This release targets the Extract (read-only) profile only:
+
+- **Extract profile (read-only)**: listing, head/metadata, streaming/range reads, optional presigned GET/HEAD. No mutations (no put/copy/delete/multipart upload).
+- **Full profile (read/write)**: Extract profile plus creation/update/delete, copy, multipart upload, and upload streaming.
+
+Connectors SHOULD advertise supported profile(s) and notable capabilities (e.g., `versioning`, `checksums`, `multipart`). In this release, connectors MUST implement and declare the Extract profile; Full profile is out of scope.
+ 
+Capability discovery (suggested):
+
+```ts
+getCapabilities(): {
+  profiles: string[] // e.g., ["extract"] or ["extract","full"]
+  features: {
+    versioning?: boolean
+    multipart?: boolean
+    checksums?: ("crc32" | "crc32c" | "md5" | "sha256")[]
+    presign?: { get?: boolean, head?: boolean }
+    eventNotifications?: boolean
+  }
+}
+```
+
+### Configuration Structure
+
+#### Base Configuration
+
+- **provider**: s3 | gcs | azure | minio | other
+- **region**: Provider region or location
+- **endpointUrl**: Custom endpoint for self-hosted or emulators
+ - **defaultBucket**: Optional default bucket name
+- **userAgent**: Outbound identifier (include app version/commit when available)
+- **timeouts**: `{ connectTimeoutMs, readTimeoutMs, operationTimeoutMs }`
+- **proxy**: `{ host, port, protocol, credentials }`
+- **tls**: TLS options (verify, CA bundle, mTLS)
+- **pooling**: Connection/HTTP pooling settings
+
+#### Authentication
+
+Support profile-appropriate auth types:
+
+- **cloudProvider**: Access key/secret, STS/assume-role, workload identity, service account
+- **sdkAuth**: Provider SDK default chain or profile
+- **oauth2 / sas / sharedKey**: Where applicable (Azure/GCS)
+
+Auth interface:
+
+- **authenticate(context)**, **refresh()**, **isValid()**
+
+#### Retry Configuration
+
+- **maxAttempts**, **initialDelay**, **maxDelay**, **backoffMultiplier**
+- **retryBudgetMs**
+- **respectRetryAfter** (when provider returns hints)
+- **retryableStatusCodes** (for HTTP backends)
+- **retryableErrors** (e.g., Throttling, SlowDown, transient network)
+- **idempotency** (see Idempotency)
+
+#### Rate Limiting and Concurrency
+
+- **requestsPerSecond**, **requestsPerMinute**, **requestsPerHour**
+- **concurrentRequests** (global semaphore, independent of rate limits)
+- **burstCapacity** (token bucket)
+- **adaptiveFromBackend**: Update limits from backend attributes (headers/metadata)
+
+#### Blob-specific Settings
+
+- (Full profile only) **multipart**: `{ thresholdBytes, partSizeBytes, maxConcurrentParts, checksumAlgorithm }`
+- **checksums**: Enable/require checksum validation (ETag/CRC32C/MD5/etc.)
+- **encryption**: `{ sse, kmsKeyId, customerProvidedKey }`
+- **versioning**: defaultVersioningBehavior, returnVersionId
+- **listDefaults**: `{ pageSize, delimiter, includeVersions }`
+
+### Retry Mechanism
+
+Implement robust retries with:
+
+1. **Exponential Backoff + Jitter**  
+   delay = min(initialDelay × (multiplier ^ attempt), maxDelay) × (0.5 + rand(0..0.5))
+
+2. **Retry Budget**  
+   Abort when per-operation budget is exhausted.
+
+3. **Circuit Breaker**  
+   Prevent cascading failures; support open → half-open → closed transitions.
+
+4. **Provider Hints**  
+   Respect `Retry-After` (HTTP) or provider-specific throttling signals (e.g., `SlowDown`, `Throttling`).
+
+5. **Idempotency**  
+   Use conditional writes or content hashes for safe retries where supported.
+
+Compliance note: It is acceptable to use the provider SDK's built-in retry strategy (including backoff/jitter and retryable classification). A connector MAY additionally enforce a per-operation `retryBudgetMs` and a circuit breaker at the connector layer.
+
+### Hook System
+
+Hooks customize behavior without modifying core logic.
+
+- Hook types: **beforeOperation**, **afterOperation**, **onError**, **onRetry**
+- Context includes: `operation`, `input`, `result`, `error`, `metadata`
+- Context methods: `modifyInput(updates)`, `modifyResult(updates)`, `abort(reason)`
+- Common hooks: auth application, request/response logging, metrics, progress events, response transformation, error enrichment
+
+When using provider SDKs, do not implement request signing in hooks. Use hooks for tracing, metrics, progress, and transformation.
+
+PSEUDOCODE pipeline:
+
+```text
+1. Build operation (defaults → per-call options → auth → user hooks)
+2. Rate limiter: waitForSlot()
+3. beforeOperation hooks (priority order)
+4. Execute (with timeout + cancellation)
+5. afterOperation hooks (transform/validate)
+6. onError hooks (map/enrich), maybe shouldRetry → backoff
+7. Metrics/logging at each stage
+```
+
+### Response Structure
+
+All responses are wrapped consistently:
+
+- **data**: Operation-specific payload (object bytes, metadata, page of items)
+- **status**: `number | string | null` (provider-agnostic)
+- **attributes**: Key-value attributes (e.g., `ETag`, `VersionId`, `ContentLength`)
+- **meta**: `{ timestamp, duration, retryCount, rateLimit, requestId, checksumVerified? }`
+
+If checksum verification is performed, set `checksumVerified` and surface the algorithm used in `attributes` (e.g., `ChecksumCRC32C`, `ETag`).
+
+Notes:
+- `meta.timestamp` MUST be RFC 3339 format.
+- Durations are expressed in milliseconds; sizes in bytes.
+
+### Metadata Normalization and Validation
+
+- Normalize common attributes across providers into stable keys: `ETag`, `VersionId`, `ContentLength`, `ContentType`, `LastModified`, `ChecksumCRC32C?`, `ChecksumSHA256?`.
+- Preserve provider-specific attributes under a namespaced key when useful (e.g., `x-amz-storage-class`).
+- Validate user metadata keys/values against provider constraints (character set, size limits).
+- Validate range requests: `bytes=start-end`, suffix (`-N`), prefix (`N-`). Reject invalid or overlapping ranges.
+
+Normalized attributes (canonical keys and formats):
+
+```text
+ETag: string
+VersionId?: string
+ContentLength: number
+ContentType?: string
+LastModified?: string (RFC 3339)
+ChecksumCRC32C?: string (base64)
+ChecksumSHA256?: string (hex or base64; specify in attributes)
+StorageClass?: string
+```
+
+### Error Handling
+
+All errors include: `message`, `code`, `statusCode?`, `details?`, `retryable`, `requestId?`, `source`.
+
+Standard error codes include:
+
+- NETWORK_ERROR, TIMEOUT, AUTH_FAILED, RATE_LIMIT, INVALID_REQUEST, SERVER_ERROR,
+- OBJECT_NOT_FOUND, BUCKET_NOT_FOUND, PRECONDITION_FAILED, CHECKSUM_MISMATCH,
+- PARSING_ERROR, VALIDATION_ERROR, CANCELLED, UNSUPPORTED
+
+Best practices:
+
+- Preserve provider error information and request IDs
+- Provide actionable messages and include operation context
+- Distinguish retryable vs. non-retryable
+
+Provider error mapping examples:
+
+```text
+S3:
+  NoSuchKey → OBJECT_NOT_FOUND
+  NoSuchBucket → BUCKET_NOT_FOUND
+  PreconditionFailed → PRECONDITION_FAILED
+  SlowDown / Throttling → RATE_LIMIT (retryable)
+
+Azure Blob:
+  BlobNotFound → OBJECT_NOT_FOUND
+  ContainerNotFound → BUCKET_NOT_FOUND
+  ConditionNotMet → PRECONDITION_FAILED
+
+GCS:
+  404 object not found → OBJECT_NOT_FOUND
+  404 bucket not found → BUCKET_NOT_FOUND
+  412 → PRECONDITION_FAILED
+  429 / 503 → RATE_LIMIT (retryable)
+```
+
+### Pagination Support
+
+Pagination options:
+
+- **pageSize**, **startToken**, **strategy**: `sdkPaginator | token | offset | page | delimiter`
+- Extractors: **extractNext(response)**, **extractItems(response)**, **hasNext(response)**
+
+Implementation requirements:
+
+1. Return an iterator (memory efficient)
+2. Transparently fetch subsequent pages
+3. Yield arrays of items per page
+4. Stop when no more pages
+5. When a `delimiter` is provided, include `commonPrefixes` (or provider equivalent) in the page items
+
+Iterator item shape (conceptual): `{ items: object[], commonPrefixes?: string[] }`
+
+`getObjects` must internally use this iterator to enumerate pages and yield per-object results in a streaming fashion, honoring continuation tokens and backpressure.
+
+Delimiter semantics:
+
+- When `delimiter` is set, each page MUST include `commonPrefixes` representing "directory" groupings alongside `items` for object summaries in the current prefix.
+- Continuation across pages MUST preserve delimiter behavior (no duplication, stable traversal).
+
+Example iterator usage:
+
+```text
+for page in listObjects({ prefix: "logs/", delimiter: "/", pageSize: 100 }):
+  use page.items
+  if page.commonPrefixes: enqueue page.commonPrefixes for traversal
+```
+
+### Concurrency, Cancellation, and Timeouts
+
+- **Cancellation token**: All operations accept a token to cancel in-flight work
+- **Per-call timeout**: Enforce via transport/SDK and abort on expiry (raise TIMEOUT)
+- **Global shutdown**: Drain in-flight operations before disconnect
+- **Max concurrency**: Use a semaphore; keep independent from rate limits
+
+Multipart concurrency:
+
+- Configure separate limits for multipart uploads: `{ maxConcurrentParts, partSizeBytes }`.
+- Enforce bounded parallelism per object and a global cap to avoid resource exhaustion.
+
+`getObjects` concurrency:
+
+- Respect `maxConcurrentDownloads` (default to global cap if unspecified).
+- Guarantee forward progress under backpressure; pause enumeration when download queue is full.
+
+PSEUDOCODE request with cancellation and timeout:
+
+```text
+IF !canProceed() THEN waitForSlot()
+START timer(operationTimeout)
+TRY execute
+IF cancelled OR timer expired → abort transport → raise TIMEOUT/CANCELLED
+ALWAYS release slot
+```
+
+### Streaming and Large Payloads
+
+- Support streaming reads with backpressure and cancellation (writes are Full profile only)
+- (Full profile only) Multipart uploads with concurrent parts and resume capability
+- Validate checksums/ETag when provided; surface verification status
+- Range GETs for partial reads
+- Progress events exposed via hooks or callbacks
+
+`getObjects` streaming:
+
+- Emit per-object progress and completion events via hooks or the `onObject` callback.
+- Default to streaming bodies; allow `includeBody: true` to buffer small objects fully when required.
+
+Checksum and ETag semantics:
+
+- On S3, multipart object `ETag` is not a simple MD5 of the full object. Treat `ETag` as an opaque identifier for multipart objects.
+- Prefer explicit checksum headers where available (e.g., `x-goog-hash: crc32c=…` on GCS). When verifying, record `meta.checksumVerified` and the algorithm used.
+
+### Presigned URLs (optional)
+
+- **GET/HEAD**: generate presigned URLs with configurable expiry. Support optional response header overrides (e.g., `Content-Type`, `Cache-Control`).
+- (Full profile only) **PUT**: generate presigned PUT URLs for direct uploads; document required headers to be signed (e.g., `Content-Type`).
+- (Full profile only) **Multipart**: when supported, expose presigned URLs for initiate, upload-part (by index), complete, and abort operations.
+- Document CORS considerations for browser usage (allowed methods, headers, and origins) and path-style vs. virtual-hosted-style for S3-compatible endpoints.
+
+### Event Notifications (optional)
+
+- Support consumption of provider event notifications (e.g., S3 Event Notifications, Azure Event Grid, GCS Pub/Sub) when applicable to downstream workflows.
+- Verify authenticity (signatures or trusted source), validate timestamps to prevent replay, and de-duplicate events (delivery IDs).
+- Treat delivery as at-least-once; design idempotent consumers.
+
+### Rate Limiting
+
+Methods:
+
+- **canProceed()**, **waitForSlot()**, **updateFromBackend(attributes)**, **getStatus()**
+
+Status fields:
+
+- **limit**, **remaining**, **reset**, **retryAfter**
+
+Strategies:
+
+- Token Bucket, Sliding Window, Fixed Window, Adaptive from backend signals (headers/metadata)
+
+Note: Many S3-compatible providers (including MinIO) do not expose rate-limit headers. `adaptiveFromBackend` is optional and often not available.
+ 
+Provider throttling mapping:
+
+- Map provider throttling signals to `RATE_LIMIT` and apply backoff (e.g., `SlowDown`, `Throttling`).
+- If a `retryAfterSeconds` hint is exposed via SDK metadata, honor it within the retry budget.
+
+Preferred strategies:
+
+- When providers do not expose rate-limit headers (common for S3-compatible backends), use a local token bucket with jittered replenishment and bounded concurrency.
+- When hints exist (e.g., HTTP `Retry-After`, GCS 429/503, Azure 429), respect them while still enforcing a per-operation retry budget.
+
+### Authentication Strategies
+
+Methods: **authenticate**, **refresh**, **isValid**. Types include cloud provider credentials, service accounts, SAS/shared keys, oauth2 where applicable.
+
+Best practices: secure storage, automatic refresh/rotation, graceful failure, runtime switching where relevant.
+
+### Idempotency
+
+- (Full profile only) Use conditional requests (If-Match/If-None-Match) when available
+- Derive stable idempotency keys from operation name + stable inputs (e.g., content hash)
+- Avoid silent replays when unsupported; document semantics clearly
+
+PSEUDOCODE idempotency key (when conditional headers cannot be used):
+
+```text
+key = hash(operation + bucket + key + contentHash + stableOptions)
+set conditional headers where available; otherwise include key in a dedicated header or metadata field if safe
+```
+
+Provider preconditions and guidance (Full profile only):
+
+- S3: prefer `If-Match` / `If-None-Match` with `ETag` for PUT/DELETE where supported; for copy, use `x-amz-copy-source-if-match` variants.
+- Azure Blob: support `If-Match` / `If-None-Match` with ETag across write operations.
+- GCS: use `ifGenerationMatch` / `ifMetagenerationMatch` query parameters for writes and metadata updates.
+- When preconditions are unavailable, derive a stable idempotency key from a content hash and identifiers, and store in safe user metadata where appropriate.
+
+### Versioning and Consistency
+
+- Surface and respect object versioning when enabled
+- Document consistency guarantees (e.g., eventual consistency on listings)
+- Expose options for version selection and delete markers
+
+### Best Practices
+
+- Connection pooling
+- Request deduplication (content-based)
+- Caching of HEAD/metadata where safe
+- Compression (where applicable)
+- Structured logging with request IDs
+- Metrics: request count, latency, bytes, retries, errors, in-flight, rate limits
+- Graceful shutdown and resource cleanup
+
+### Observability
+
+- Logging: structured, redacted, correlation via `requestId`
+- Metrics: counters (operations, errors, retries), distributions (latency, payload sizes), gauges (in-flight, rate limits)
+- Tracing: span per operation with attributes for operationName, bucket, key, status, retryCount, rateLimit
+
+Recommended span attributes:
+
+- `operationName`, `bucket`, `key`, `objectSizeBytes?`, `partIndex?`, `partCount?`, `retryCount`, `rateLimit`, `checksumVerified?`
+
+### Security and Compliance
+
+- Redact secrets in logs/metrics/errors
+- Validate inputs/outputs; reject malformed data early
+- TLS by default; custom CA bundles and optional mTLS
+- Encryption at rest/in transit; KMS integration; key rotation
+- Data residency/minimization; avoid storing payloads unless enabled
+
+Provider encryption guidance:
+
+- SSE-S3/SSE-KMS: surface KMS key ID when appropriate; do not log customer-managed keys.
+- SSE-C (customer-provided keys): never log or emit keys; ensure keys are redacted from traces and metrics.
+- When checksums are sensitive, avoid logging raw checksum values; prefer boolean `checksumVerified`.
+
+### Testing Requirements
+
+Include:
+
+- Unit tests for all public methods
+- Integration tests against emulators (MinIO/LocalStack/Azurite/GCS emulator)
+- Retry logic tests (network faults, throttling/SlowDown)
+- Rate limit tests and concurrency controls
+- Authentication flow tests
+- Streaming tests (reads); multipart upload tests are Full profile only
+- Performance benchmarks (large objects)
+- Presigned GET/HEAD generation and CORS behavior (where relevant)
+ - (Full profile only) Large object boundaries (near and above multipart threshold)
+ - Range read edge cases (suffix/prefix ranges, overlapping, invalid ranges)
+ - (Full profile only) Multipart upload error handling and resume semantics (including part failures and re-tries)
+ - Versioned bucket behaviors including delete markers; ensure correct HEAD/GET semantics
+ - Object lock / immutability policy scenarios when applicable
+ - `getObjects` end-to-end throughput, checkpoint/resume correctness, per-object error handling
+
+### Conformance Checklist (Extract-only release)
+
+- Declares implemented profile(s): Extract (read-only)
+- Implements lifecycle: initialize, connect, disconnect, isConnected
+- Provides operation primitives (execute) and typed blob operations limited to Extract profile (read-only)
+- Config supports provider/region/endpoint, timeouts, proxy/tls, auth, retry, rate limit, concurrency, checksums, encryption, versioning; multipart is Full profile only
+- Retry with backoff + jitter, respects provider hints, circuit breaker, retry budget
+- Hook pipeline before/after/error/retry; deterministic order and cancellation
+- Response wrapper with data/status/attributes/meta (requestId, rateLimit, checksumVerified)
+- Structured errors with code/status/retryable/details and correlation id
+- Pagination supports sdkPaginator/token/offset/page/delimiter with pluggable extractors
+- Concurrency limits, cancellation, timeouts, graceful shutdown
+- Observability: logs/metrics/traces with redaction
+- Security controls: TLS, encryption, validation, redaction
+
+- Exposes `getCapabilities()` for profile/feature discovery
+
+### Versioning and Compatibility
+
+- Semantic versioning for the connector contract.
+- Prefer backward-compatible evolution; document breaking changes and provide migration notes.
+- Use capability flags/profile declarations to gate optional features (e.g., multipart, checksums, presign, eventNotifications).
+
+### Provider-specific Options
+
+S3-compatible options (if applicable):
+
+- `forcePathStyle`: use path-style addressing (common for MinIO and local emulators)
+- `useArnRegion`: allow ARN region usage for multi-region access points
+- `signatureVersion?`: e.g., `s3v4`
+
+Azure Blob options (if applicable):
+
+- `blobType`: e.g., `BlockBlob` (default)
+- `tier`: Hot | Cool | Archive; `rehydratePriority` when restoring from Archive
+- `customerProvidedKey`: client-side encryption key handling
+- `immutabilityPolicy` / `legalHold`: configure if required
+- `retry` / `transport` pipeline tuning (per Azure SDK conventions)
+
+GCS options (if applicable):
+
+- `ifGenerationMatch` / `ifMetagenerationMatch`
+- `checksums`: prefer `crc32c`; `kmsKeyName` for server-side encryption
+- `uniformBucketLevelAccess`: note ACL implications
+
